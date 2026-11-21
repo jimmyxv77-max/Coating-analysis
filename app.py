@@ -384,21 +384,24 @@ def predict_full_process(records, line_type, slurry_sys, solid_content, md_a, md
     rec_low_t = np.round(base_low_t + temp_shift * zone_weights).astype(int).tolist()
     rec_up_t  = np.round(base_up_t + temp_shift * zone_weights).astype(int).tolist()
     
+    # 水分目标越低 (moist_delta 越大)，对传质除湿与风频/风速的需求越高；后段 (5~8节) 对水分影响更敏感
+    zone_wind_weights = np.array([0.6, 0.7, 0.9, 1.0, 1.1, 1.15, 1.2, 1.25])
     if "新线" in line_type:
         fan_unit = "rpm"
-        scale_fan = float(np.clip(1.0 + (w_load_new - 160.0) / 600.0, 0.92, 1.12))
-        rec_low_sup = [int(round(x * scale_fan / 20) * 20) for x in [1080, 1200, 1320, 1320, 1440, 1080, 1080, 1080]]
-        rec_low_exh = [int(round(x * scale_fan / 20) * 20) for x in [1200, 1320, 1440, 1440, 1560, 1280, 1280, 1200]]
-        rec_up_sup  = [int(round(x * scale_fan / 20) * 20) for x in [1140, 1320, 1500, 1560, 1750, 1750, 1850, 1850]]
-        rec_up_exh  = [int(round(x * scale_fan / 20) * 20) for x in [1260, 1440, 1620, 1680, 2220, 2220, 2280, 2280]]
+        base_scale_fan = float(np.clip(1.0 + (w_load_new - 160.0) / 600.0, 0.92, 1.12))
+        moist_fan_adj = float(np.clip(moist_delta * 0.025, -0.08, 0.12))
+        rec_low_sup = [int(round(x * float(np.clip(base_scale_fan + moist_fan_adj * w_z, 0.88, 1.20)) / 20) * 20) for x, w_z in zip([1080, 1200, 1320, 1320, 1440, 1080, 1080, 1080], zone_wind_weights)]
+        rec_low_exh = [int(round(x * float(np.clip(base_scale_fan + moist_fan_adj * w_z, 0.88, 1.20)) / 20) * 20) for x, w_z in zip([1200, 1320, 1440, 1440, 1560, 1280, 1280, 1200], zone_wind_weights)]
+        rec_up_sup  = [int(round(x * float(np.clip(base_scale_fan + moist_fan_adj * w_z, 0.88, 1.20)) / 20) * 20) for x, w_z in zip([1140, 1320, 1500, 1560, 1750, 1750, 1850, 1850], zone_wind_weights)]
+        rec_up_exh  = [int(round(x * float(np.clip(base_scale_fan + moist_fan_adj * w_z, 0.88, 1.20)) / 20) * 20) for x, w_z in zip([1260, 1440, 1620, 1680, 2220, 2220, 2280, 2280], zone_wind_weights)]
         air_balance = {"下新风Hz": 28, "下排风Hz": 35, "下外排Hz": 38, "上新风Hz": 34, "上排风Hz": 35, "上外排Hz": 40}
     else:
         fan_unit = "Hz"
-        hz_shift = int(np.clip(round(load_delta * 1.5 + moist_delta * 1.0), -3, 5))
-        rec_low_sup = [x + hz_shift for x in [18, 20, 22, 24, 24, 25, 25, 26]]
-        rec_low_exh = [x + hz_shift for x in [18, 20, 22, 24, 24, 25, 25, 26]]
-        rec_up_sup  = [x + hz_shift for x in [19, 20, 23, 26, 29, 31, 33, 35]]
-        rec_up_exh  = [x + hz_shift for x in [19, 20, 23, 26, 29, 31, 33, 35]]
+        base_hz_shift = load_delta * 1.5 + moist_delta * 1.5
+        rec_low_sup = [int(x + np.clip(round(base_hz_shift * w_z), -4, 6)) for x, w_z in zip([18, 20, 22, 24, 24, 25, 25, 26], zone_wind_weights)]
+        rec_low_exh = [int(x + np.clip(round(base_hz_shift * w_z), -4, 6)) for x, w_z in zip([18, 20, 22, 24, 24, 25, 25, 26], zone_wind_weights)]
+        rec_up_sup  = [int(x + np.clip(round(base_hz_shift * w_z), -4, 6)) for x, w_z in zip([19, 20, 23, 26, 29, 31, 33, 35], zone_wind_weights)]
+        rec_up_exh  = [int(x + np.clip(round(base_hz_shift * w_z), -4, 6)) for x, w_z in zip([19, 20, 23, 26, 29, 31, 33, 35], zone_wind_weights)]
         air_balance = {"下新风Hz": 28, "下排风Hz": 32, "下外排Hz": 35, "上新风Hz": 34, "上排风Hz": 40, "上外排Hz": 40}
         
     return {
@@ -551,16 +554,16 @@ with tab_hybrid:
 
             if slurry_sys == "纯石墨" and solid_content >= 0.50 and pred["w_load"] < 160:
                 st.info(
-                    f"**工艺诊断结论**：当前为高固含量（{solid_content*100:.1f}%）`{slurry_sys}` 方案，B面单面溶剂蒸发负荷 $W_{{\\text{{load}}}} = {pred['w_load']}$ 处于较低水平。"
+                    f"**工艺诊断结论**：当前为高固含量（{solid_content*100:.1f}%）`{slurry_sys}` 方案，B面单面溶剂蒸发负荷 $W_{{\text{{load}}}} = {pred['w_load']}$ 处于较低水平。"
                     f"烘箱前1~2节建议采用缓升温（下层 `{pred['rec_low_t'][0]}/{pred['rec_low_t'][1]}℃`、上层 `{pred['rec_up_t'][0]}/{pred['rec_up_t'][1]}℃`），避免表面结皮导致粘结剂迁移。"
                 )
             elif pred["w_load"] > 205:
                 st.warning(
-                    f"**工艺诊断结论**：当前溶剂蒸发负荷 $W_{{\\text{{load}}}} = {pred['w_load']}$ 较高，需重点关注主干燥区（3~7节）排风抽湿与温度梯度配合，防止干燥不足导致水分超标或起泡。"
+                    f"**工艺诊断结论**：当前溶剂蒸发负荷 $W_{{\text{{load}}}} = {pred['w_load']}$ 较高，需重点关注主干燥区（3~7节）排风抽湿与温度梯度配合，防止干燥不足导致水分超标或起泡。"
                 )
             else:
                 st.success(
-                    f"**工艺诊断结论**：当前参数组合整体均衡（$W_{{\\text{{load}}}} = {pred['w_load']}$，B净增比 `{pred['b_net_ratio']}%`），可按下方泵速、刀距与8节温风谱试涂验证。"
+                    f"**工艺诊断结论**：当前参数组合整体均衡（$W_{{\text{{load}}}} = {pred['w_load']}$，B净增比 `{pred['b_net_ratio']}%`），可按下方泵速、刀距与8节温风谱试涂验证。"
                 )
 
             wa = md_a * PUNCH_AREA_CM2
