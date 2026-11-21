@@ -1,6 +1,4 @@
-import ast
-
-app_code = '''import streamlit as st
+import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -173,7 +171,6 @@ def parse_uploaded_coating_excel(file_bytes):
                 md_b_tot = float(rb["mg/cm2"])
                 sc = float(ra["固含量"]) if pd.notna(ra.get("固含量")) else 0.50
                 sys_name = str(ra["浆料体系"]).strip() if pd.notna(ra.get("浆料体系")) else "纯石墨"
-                # 识别速度与泵速列
                 speed, pa, pb = 30.0, 45.0, 48.0
                 for spd_val, col_name in [(30.0, "30m泵速"), (28.0, "28m泵速"), (35.0, "35m泵速"), (15.0, "15m泵速")]:
                     if col_name in raw.columns and pd.notna(ra.get(col_name)) and pd.notna(rb.get(col_name)):
@@ -343,7 +340,7 @@ with st.sidebar:
 
 # ==================== 主界面 ====================
 st.title("🔋 锂电涂布与烘箱干燥全参数智能预测与工艺诊断系统 V2.1")
-st.markdown("同时支持**文件导入扩库**与**界面手动输入设计参数**，输出泵速/刀距/公差、溶剂蒸发负荷 ($W_{\\text{load}}$)、8节温风谱与工艺风险分析。")
+st.markdown("同时支持**文件导入扩库**与**界面手动输入设计参数**，输出泵速/刀距/公差、溶剂蒸发负荷 ($W_{\text{load}}$)、8节温风谱与工艺风险分析。")
 
 tab_hybrid, tab_diag, tab_oven, tab_foil = st.tabs([
     "🎯 手动设计输入 + 文件导入联合分析",
@@ -356,7 +353,6 @@ tab_hybrid, tab_diag, tab_oven, tab_foil = st.tabs([
 with tab_hybrid:
     st.subheader("🎯 设计参数输入（支持随时导入文件作为参考/训练基线，并手动微调任意设计参数）")
     
-    # 顶部快捷：可选择从已导入/库中一键载入某型号作为手动输入的初始值
     db_models = [r["型号"] for r in st.session_state.db_records]
     c_load1, c_load2 = st.columns([2, 1])
     with c_load1:
@@ -364,7 +360,6 @@ with tab_hybrid:
     with c_load2:
         st.caption(f"当前可用样本：{len(db_models)} 个型号")
 
-    # 确定初始默认值
     if preset_model != "手动自定义输入":
         m_rec = next((r for r in st.session_state.db_records if r["型号"] == preset_model), None)
     else:
@@ -435,7 +430,6 @@ with tab_hybrid:
             k4.metric("溶剂蒸发负荷", f"{pred['w_load']}", delta=f"B净增 {pred['b_net_ratio']}%")
             k5.metric("目标水分控制", f"≤ {target_moist} ppm")
 
-            # 分析结论摘要
             if slurry_sys == "纯石墨" and solid_content >= 0.50 and pred["w_load"] < 160:
                 st.info(
                     f"**工艺诊断结论**：当前为高固含量（{solid_content*100:.1f}%）`{slurry_sys}` 方案，B面单面溶剂蒸发负荷 $W_{{\\text{{load}}}} = {pred['w_load']}$ 处于较低水平。"
@@ -450,7 +444,6 @@ with tab_hybrid:
                     f"**工艺诊断结论**：当前参数组合整体均衡（$W_{{\\text{{load}}}} = {pred['w_load']}$，B净增比 `{pred['b_net_ratio']}%`），可按下方泵速、刀距与8节温风谱试涂验证。"
                 )
 
-            # 称片重与公差表
             wa = md_a * PUNCH_AREA_CM2
             wb = md_b_total * PUNCH_AREA_CM2
             coat_summary = pd.DataFrame([
@@ -459,7 +452,6 @@ with tab_hybrid:
             ])
             st.dataframe(coat_summary, use_container_width=True, hide_index=True)
 
-            # 8节烘箱温风推荐表
             oven_table = pd.DataFrame(
                 [
                     pred["rec_low_t"],
@@ -481,7 +473,6 @@ with tab_hybrid:
             )
             st.dataframe(oven_table, use_container_width=True)
 
-            # 8节温度曲线可视化
             zones = [f"第{i}节" for i in range(1, 9)]
             fig_ov_pred = go.Figure()
             fig_ov_pred.add_trace(go.Scatter(x=zones, y=pred["rec_up_t"], name="推荐上层温度(℃)", line=dict(color="#d62728", width=3)))
@@ -541,7 +532,7 @@ with tab_diag:
 
 # -------------------- TAB 3: 烘箱温风与真实水分关联分析 --------------------
 with tab_oven:
-    st.subheader("🌡️ 溶剂蒸发负荷 ($W_{\\text{load}}$)、烘箱均值温度与真实水分（ppm）关联规律")
+    st.subheader("🌡️ 溶剂蒸发负荷 ($W_{\text{load}}$)、烘箱均值温度与真实水分（ppm）关联规律")
     viz_rows = []
     for r in st.session_state.db_records:
         m = compute_physics_metrics(r)
@@ -615,9 +606,3 @@ with tab_foil:
                 "边缘留白(mm)": round(edge_gap, 2)
             })
         st.dataframe(pd.DataFrame(zones_calc), use_container_width=True, hide_index=True)
-'''
-
-ast.parse(app_code)
-with open("coating_predictor_v2/app.py", "w", encoding="utf-8") as f:
-    f.write(app_code)
-print("Updated coating_predictor_v2/app.py and passed AST check!")
