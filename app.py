@@ -226,11 +226,10 @@ def compute_physics_metrics(rec):
     b_net = rec["B总面密度"] - rec["A面密度"]
     q_a = (rec["A面密度"] / rec["固含量"]) * rec["线速"]
     q_b = (b_net / rec["固含量"]) * rec["线速"]
-    # 单面溶剂蒸发负荷 W_load (g/m2 * m/min): 涂层干重 * (1-固含量)/固含量 * 线速度
     w_load = (b_net * (1.0 - rec["固含量"]) / rec["固含量"]) * rec["线速"]
     t_up_avg = np.mean(rec["上温8节"])
     t_low_avg = np.mean(rec["下温8节"])
-    t_front_up = np.mean(rec["上温8节"][:2])  # 1-2节升温斜率控制区
+    t_front_up = np.mean(rec["上温8节"][:2])
     t_peak_up = np.max(rec["上温8节"])
     return {
         "B净面密度": round(b_net, 3),
@@ -244,13 +243,7 @@ def compute_physics_metrics(rec):
     }
 
 def predict_full_process(records, line_type, slurry_sys, solid_content, md_a, md_b_net, line_speed, width_mm, target_moisture_ppm):
-    """
-    全工艺联合推演引擎：
-    1. 涂布泵速 & 刀距（湿浆流变质量守恒 + 宽幅归一化）
-    2. 8节上下烘箱温度曲线（基于溶剂蒸发负荷 W_load、固含量防龟裂限制、目标水分闭环补偿）
-    3. 8节上下循环风频/风机转速（根据设备类型自动切换 Hz 或 rpm 阶梯谱）
-    4. 新风/排风/外排平衡设定（维持微负压防溶剂外溢）
-    """
+    """全工艺联合推演引擎"""
     df = pd.DataFrame(records)
     df["B净面密度"] = df["B总面密度"] - df["A面密度"]
     df["Q_A"] = (df["A面密度"] / df["固含量"]) * df["线速"]
@@ -259,7 +252,6 @@ def predict_full_process(records, line_type, slurry_sys, solid_content, md_a, md
     df["K_A_std"] = (df["A泵速"] / df["Q_A"]) / df["width_factor"]
     df["K_B_std"] = (df["B泵速"] / df["Q_B"]) / df["width_factor"]
     
-    # 1. 泵速预测
     sub_sys = df[df["体系"] == slurry_sys]
     k_a = sub_sys["K_A_std"].mean() if len(sub_sys) > 0 else df["K_A_std"].mean()
     k_b = sub_sys["K_B_std"].mean() if len(sub_sys) > 0 else df["K_B_std"].mean()
@@ -270,7 +262,6 @@ def predict_full_process(records, line_type, slurry_sys, solid_content, md_a, md
     pred_pump_a = round(q_a_new * k_a * wf_new, 1)
     pred_pump_b = round(q_b_new * k_b * wf_new, 1)
     
-    # 2. 刀距预测 (基于湿膜厚度 + 体系粘度补偿)
     df["H_wet_A"] = df["A面密度"] / df["固含量"]
     df["H_wet_B"] = df["B净面密度"] / df["固含量"]
     df["is_graphite"] = (df["体系"] == "纯石墨").astype(int)
@@ -282,10 +273,8 @@ def predict_full_process(records, line_type, slurry_sys, solid_content, md_a, md
     pred_gap_a = round(float(reg_ga.predict([[md_a / solid_content, solid_content, is_g]])[0]))
     pred_gap_b = round(float(reg_gb.predict([[md_b_net / solid_content, solid_content, is_g]])[0]))
     
-    # 3. 溶剂蒸发负荷与烘箱8节温风曲线推演
     w_load_new = (md_b_net * (1.0 - solid_content) / solid_content) * line_speed
     
-    # 基准温度曲线选择：纯石墨且固含量高 -> 温和梯形曲线（防前段结皮龟裂）；硅碳/硅氧 -> 高能阶梯曲线
     if slurry_sys == "纯石墨":
         base_low_t = np.array([72, 76, 84, 88, 100, 96, 90, 86], dtype=float)
         base_up_t  = np.array([82, 88, 94, 102, 110, 106, 98, 92], dtype=float)
@@ -294,25 +283,21 @@ def predict_full_process(records, line_type, slurry_sys, solid_content, md_a, md
         base_low_t = np.array([70, 73, 82, 85, 98, 95, 90, 86], dtype=float)
         base_up_t  = np.array([78, 84, 88, 98, 108, 105, 98, 94], dtype=float)
         base_w_load = 210.0
-    else:  # 硅碳
+    else:
         base_low_t = np.array([78, 82, 88, 94, 112, 108, 102, 96], dtype=float)
         base_up_t  = np.array([92, 98, 102, 112, 120, 115, 110, 102], dtype=float)
         base_w_load = 215.0
         
-    # 根据溶剂负荷差值 & 目标水分要求进行温度微调 (每增加 50 负荷或降低 100ppm 水分，主干燥区 3-7 节提升约 3.5℃)
     load_delta = (w_load_new - base_w_load) / 50.0
     moist_delta = (500.0 - target_moisture_ppm) / 100.0
     temp_shift = np.clip(load_delta * 3.0 + moist_delta * 2.5, -10.0, 12.0)
     
-    # 前1-2节权重减半，防止入口急剧升温导致泥裂/卷边
     zone_weights = np.array([0.4, 0.5, 0.9, 1.0, 1.1, 1.0, 0.9, 0.7])
     rec_low_t = np.round(base_low_t + temp_shift * zone_weights).astype(int).tolist()
     rec_up_t  = np.round(base_up_t + temp_shift * zone_weights).astype(int).tolist()
     
-    # 4. 风机频率 / 转速曲线匹配
     if "新线" in line_type:
         fan_unit = "rpm"
-        # 新线下层5-8节降速防吹皱，上层5-8节高速抽湿
         scale_fan = np.clip(1.0 + (w_load_new - 160.0) / 600.0, 0.92, 1.12)
         rec_low_sup = [round(x * scale_fan / 20) * 20 for x in [1080, 1200, 1320, 1320, 1440, 1080, 1080, 1080]]
         rec_low_exh = [round(x * scale_fan / 20) * 20 for x in [1200, 1320, 1440, 1440, 1560, 1280, 1280, 1200]]
@@ -368,10 +353,10 @@ with tab_diag:
         st.markdown("#### 1. 涂布核心参数核验（极优 ✅）")
         diag_coat_df = pd.DataFrame([
             {"参数项": "浆料体系 / 固含量", "7A模拟设定": "纯石墨 / 52.0%", "对标基准 (XK新线 / 20CT)": "XK: 硅碳45% | 20CT: 纯石墨49.5%", "诊断结论": "✅ 固含量高，溶剂负荷低"},
-            {"参数项": "A面 / B面总面密度", "7A模拟设定": "4.74 / 9.78 mg/cm²", "B净增比 +6.33% (5.04 mg/cm²)", "诊断结论": "✅ 完全吻合 +6.1% 补偿规律"},
-            {"参数项": "30m/min 泵速 (A/B)", "7A模拟设定": "44.4 / 47.2 rpm", "流量比 K_pump = 0.1624 / 0.1623", "诊断结论": "✅ 与XK(0.1625)高度一致，精准"},
-            {"参数项": "涂布刀距 (A/B)", "7A模拟设定": "105 / 170 μm", "湿膜厚 9.12 / 9.69 (差值+65μm)", "诊断结论": "⚠️ 略偏大5~10μm(纯石墨可微调至98/163)"},
-            {"参数项": "垫片与分区涂宽", "7A模拟设定": "124.4*3-124.3*2 (涂宽124.6)", "箔宽672居中，削薄区8mm", "诊断结论": "✅ 分区与垫片完全匹配"}
+            {"参数项": "A面 / B面总面密度", "7A模拟设定": "4.74 / 9.78 mg/cm²", "对标基准 (XK新线 / 20CT)": "B净增比 +6.33% (5.04 mg/cm²)", "诊断结论": "✅ 完全吻合 +6.1% 补偿规律"},
+            {"参数项": "30m/min 泵速 (A/B)", "7A模拟设定": "44.4 / 47.2 rpm", "对标基准 (XK新线 / 20CT)": "流量比 K_pump = 0.1624 / 0.1623", "诊断结论": "✅ 与XK(0.1625)高度一致，精准"},
+            {"参数项": "涂布刀距 (A/B)", "7A模拟设定": "105 / 170 μm", "对标基准 (XK新线 / 20CT)": "湿膜厚 9.12 / 9.69 (差值+65μm)", "诊断结论": "⚠️ 略偏大5~10μm(纯石墨可微调至98/163)"},
+            {"参数项": "垫片与分区涂宽", "7A模拟设定": "124.4*3-124.3*2 (涂宽124.6)", "对标基准 (XK新线 / 20CT)": "箔宽672居中，削薄区8mm", "诊断结论": "✅ 分区与垫片完全匹配"}
         ])
         st.dataframe(diag_coat_df, use_container_width=True, hide_index=True)
         
@@ -445,7 +430,6 @@ with tab_pred:
         k4.metric("溶剂蒸发负荷", f"{pred['w_load']}", delta="W_load指数")
         k5.metric("预测达成水分", f"≤ {target_moist} ppm")
         
-        # 称片重与公差表
         wa = md_a * PUNCH_AREA_CM2
         wb = md_b_total * PUNCH_AREA_CM2
         coat_summary = pd.DataFrame([
@@ -454,7 +438,6 @@ with tab_pred:
         ])
         st.dataframe(coat_summary, use_container_width=True, hide_index=True)
         
-        # 8节烘箱温风推荐表
         st.markdown(f"**推荐 8 节烘箱温风参数谱（风机单位：`{pred['fan_unit']}` ｜ 新排风设定：下 `{pred['air_balance']['下新风Hz']}/{pred['air_balance']['下排风Hz']}Hz` 上 `{pred['air_balance']['上新风Hz']}/{pred['air_balance']['上排风Hz']}Hz`）**")
         oven_table = pd.DataFrame(
             [
@@ -477,7 +460,6 @@ with tab_pred:
         )
         st.dataframe(oven_table, use_container_width=True)
         
-        # 导出完整 Excel
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             coat_summary.to_excel(writer, sheet_name="涂布参数预测", index=False)
@@ -549,7 +531,6 @@ with tab_foil:
         thick_um = st.number_input("双面极片厚度 U (μm)", 30.0, 250.0, 94.0, 0.5)
         piece_len = st.number_input("单片极片长度 (m)", 0.5, 5.0, 1.183, 0.001, format="%.3f")
         
-        # 表格内置公式: L = pi * (R^2 - (D/2)^2) / U (单位换算: mm^2 / um = m)
         max_len_m = 3.14 * (r_max**2 - (d_core / 2.0)**2) / thick_um
         max_pieces = int(max_len_m // piece_len)
         st.success(f"极限收卷长度：**{max_len_m:.2f} m** ｜ 理论最大可收卷片数：**{max_pieces} 片**（按 {int(max_pieces//50)*50} 片收卷实际长度 {(int(max_pieces//50)*50)*piece_len:.1f} m）")
@@ -561,7 +542,6 @@ with tab_foil:
         mid_gap = st.number_input("中间极耳留白宽度 (mm)", 1.0, 30.0, 7.6, 0.1)
         trim_mm = st.number_input("单侧削薄边缘避让区 (mm)", 0.0, 20.0, 8.0, 0.5)
         
-        # 5条涂布居中对称排布计算边缘留白
         edge_gap = (foil_w - 5 * coat_w - 4 * mid_gap) / 2.0
         zones_calc = []
         for idx in range(5):
