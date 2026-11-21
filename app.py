@@ -14,8 +14,18 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .stTabs [data-baseweb="tab-list"] { gap: 20px; }
-    .stTabs [data-baseweb="tab"] { height: 45px; font-weight: 600; }
+    .stTabs [data-baseweb="tab-list"] { gap: 16px; }
+    .stTabs [data-baseweb="tab"] { height: 46px; font-weight: 600; font-size: 15px; }
+    [data-testid="stMetricValue"] {
+        font-size: 1.55rem !important;
+        white-space: nowrap !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.9rem !important;
+        white-space: nowrap !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -379,7 +389,7 @@ with tab_hybrid:
     def_w_val = float(m_rec["涂布宽幅"]) if (m_rec and float(m_rec["涂布宽幅"]) in width_list) else 124.4
     def_w_idx = width_list.index(def_w_val)
 
-    c_in, c_out = st.columns([1.05, 1.75], gap="large")
+    c_in, c_out = st.columns([1.0, 1.9], gap="large")
     with c_in:
         st.markdown("#### 1. 手动输入设计参数")
         model_new = st.text_input("设计型号名称", value=def_name)
@@ -423,12 +433,14 @@ with tab_hybrid:
                 md_a, md_b_net, line_speed, width_mm, target_moist
             )
 
-            k1, k2, k3, k4, k5 = st.columns(5)
-            k1.metric("A面预测泵速", f"{pred['pred_pump_a']} rpm")
-            k2.metric("B面预测泵速", f"{pred['pred_pump_b']} rpm")
-            k3.metric("A/B 推荐刀距", f"{pred['pred_gap_a']} / {pred['pred_gap_b']} μm")
-            k4.metric("溶剂蒸发负荷", f"{pred['w_load']}", delta=f"B净增 {pred['b_net_ratio']}%")
-            k5.metric("目标水分控制", f"≤ {target_moist} ppm")
+            r1c1, r1c2, r1c3 = st.columns(3)
+            r1c1.metric("A面预测泵速", f"{pred['pred_pump_a']} rpm")
+            r1c2.metric("B面预测泵速", f"{pred['pred_pump_b']} rpm")
+            r1c3.metric("A / B 推荐刀距", f"{pred['pred_gap_a']} / {pred['pred_gap_b']} μm")
+
+            r2c1, r2c2 = st.columns(2)
+            r2c1.metric("B面溶剂蒸发负荷 W_load", f"{pred['w_load']}", delta=f"B净增 {pred['b_net_ratio']}%")
+            r2c2.metric("目标真实水分控制", f"≤ {target_moist} ppm")
 
             if slurry_sys == "纯石墨" and solid_content >= 0.50 and pred["w_load"] < 160:
                 st.info(
