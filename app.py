@@ -166,6 +166,10 @@ DEFAULT_DB = [
 
 if "db_records" not in st.session_state:
     st.session_state.db_records = DEFAULT_DB.copy()
+if "manual_design_active" not in st.session_state:
+    st.session_state.manual_design_active = False
+if "latest_manual_design" not in st.session_state:
+    st.session_state.latest_manual_design = None
 
 def parse_uploaded_coating_excel(file_bytes):
     """解析上传的涂布参数 Excel（支持 A/B 成对行格式），返回新增/更新记录列表"""
@@ -208,6 +212,7 @@ def parse_uploaded_coating_excel(file_bytes):
                     "B垫片": shunt_b,
                     "涂布宽幅": width_mm,
                     "真实水分_ppm": 480,
+                    "数据来源": "导入",
                     "备注": "由 Excel 导入",
                     "下新风Hz": 28, "下排风Hz": 35, "下外排Hz": 38,
                     "上新风Hz": 34, "上排风Hz": 35, "上外排Hz": 40,
@@ -239,6 +244,92 @@ def compute_physics_metrics(rec):
         "前2节上温均值": round(float(np.mean(rec["上温8节"][:2])), 1),
         "上温峰值": int(np.max(rec["上温8节"]))
     }
+
+SIM_KEYWORDS = ["预测", "模拟", "设计", "试产", "待产", "方案", "predict", "pred", "sim", "simulation", "design", "trial", "opt"]
+
+def has_sim_keyword(text):
+    if not text:
+        return False
+    s = str(text).strip().lower()
+    return any(kw.lower() in s for kw in SIM_KEYWORDS)
+
+def find_target_sim_record(records, manual_model_name="", manual_has_input=False):
+    for r in reversed(records):
+        name_val = str(r.get("型号", ""))
+        note_val = str(r.get("备注", ""))
+        src_val = str(r.get("数据来源", ""))
+        if ("导入" in name_val or "导入" in src_val) and (has_sim_keyword(name_val) or has_sim_keyword(note_val)):
+            return r, f"导入文件匹配关键词（型号/备注：{name_val} / {note_val}）"
+    if manual_has_input and has_sim_keyword(manual_model_name):
+        return None, f"手动输入新设计：{manual_model_name}"
+    return None, None
+
+
+def build_custom_temp_wind_figure(series_dict, title_text, primary_items, secondary_items):
+    """根据用户选择的项目条件与主/次坐标轴配置生成自定义温度与风频/风速曲线图"""
+    fig = go.Figure()
+    color_pool = [
+        "#d62728", "#1f77b4", "#2ca02c", "#ff7f0e",
+        "#9467bd", "#17becf", "#e377c2", "#bcbd22",
+        "#8c564b", "#7f7f7f", "#00b5ad", "#f28500"
+    ]
+    dash_pool = ["solid", "dash", "dot", "dashdot"]
+
+    primary_unit_hint = ""
+    secondary_unit_hint = ""
+
+    for idx, item_name in enumerate(primary_items):
+        if item_name in series_dict:
+            y_vals, unit_lbl = series_dict[item_name]
+            if not primary_unit_hint:
+                primary_unit_hint = unit_lbl
+            fig.add_trace(go.Scatter(
+                x=[f"第{i}节" for i in range(1, 9)],
+                y=y_vals,
+                name=f"{item_name} (主轴)",
+                mode="lines+markers",
+                line=dict(color=color_pool[idx % len(color_pool)], width=3, dash=dash_pool[idx % len(dash_pool)]),
+                marker=dict(size=7),
+                yaxis="y"
+            ))
+
+    for idx, item_name in enumerate(secondary_items):
+        if item_name in series_dict:
+            y_vals, unit_lbl = series_dict[item_name]
+            if not secondary_unit_hint:
+                secondary_unit_hint = unit_lbl
+            c_idx = idx + len(primary_items)
+            fig.add_trace(go.Scatter(
+                x=[f"第{i}节" for i in range(1, 9)],
+                y=y_vals,
+                name=f"{item_name} (次轴)",
+                mode="lines+markers",
+                line=dict(color=color_pool[c_idx % len(color_pool)], width=2.5, dash=dash_pool[(idx + 1) % len(dash_pool)]),
+                marker=dict(size=7, symbol="diamond"),
+                yaxis="y2"
+            ))
+
+    y1_title = f"主坐标轴 ({primary_unit_hint})" if primary_unit_hint else "主坐标轴"
+    y2_title = f"次坐标轴 ({secondary_unit_hint})" if secondary_unit_hint else "次坐标轴"
+
+    layout_kwargs = dict(
+        title=title_text,
+        xaxis=dict(title="烘箱节数"),
+        yaxis=dict(title=y1_title, side="left"),
+        height=400,
+        dragmode="pan",
+        legend=dict(orientation="v", yanchor="top", y=1.0, xanchor="left", x=1.02)
+    )
+    if secondary_items:
+        layout_kwargs["yaxis2"] = dict(
+            title=y2_title,
+            side="right",
+            overlaying="y",
+            showgrid=False
+        )
+
+    fig.update_layout(**layout_kwargs)
+    return fig
 
 def predict_full_process(records, line_type, slurry_sys, solid_content, md_a, md_b_net, line_speed, width_mm, target_moisture_ppm):
     df = pd.DataFrame(records)
@@ -344,6 +435,8 @@ with st.sidebar:
     if st.button("重置为默认基准库"):
         st.session_state.db_records = DEFAULT_DB.copy()
         st.session_state.pop("last_uploaded_key", None)
+        st.session_state.manual_design_active = False
+        st.session_state.latest_manual_design = None
         st.rerun()
     st.divider()
     st.caption(f"当前已学习 **{len(st.session_state.db_records)}** 组全参数工艺模型（覆盖硅碳、硅氧、纯石墨三大体系）。")
@@ -354,7 +447,7 @@ st.markdown("同时支持**文件导入扩库**与**界面手动输入设计参�
 
 tab_hybrid, tab_diag, tab_oven, tab_foil = st.tabs([
     "🎯 手动设计输入 + 文件导入联合分析",
-    "🩺 7A 模拟参数专项诊断",
+    "🩺 模拟参数专项诊断",
     "🌡️ 烘箱温风谱与真实水分关联分析",
     "📐 箔材/分区/卷径辅助计算"
 ])
@@ -413,6 +506,20 @@ with tab_hybrid:
             md_b_net = round(md_b_total - md_a, 3)
 
         width_mm = st.selectbox("涂布宽幅规格 (mm)", width_list, index=def_w_idx)
+        if preset_model == "手动自定义输入" and has_sim_keyword(model_new):
+            st.session_state.manual_design_active = True
+            st.session_state.latest_manual_design = {
+                "型号": model_new,
+                "产线设备": line_type,
+                "体系": slurry_sys,
+                "固含量": solid_content,
+                "A面密度": md_a,
+                "B总面密度": md_b_total,
+                "B净面密度": md_b_net,
+                "线速": float(line_speed),
+                "涂布宽幅": float(width_mm),
+                "目标水分_ppm": int(target_moist)
+            }
 
         st.markdown("#### 2. 补充导入外部参数表（可选）")
         inline_upload = st.file_uploader("此处也可直接导入 .xlsx 参数表", type=["xlsx"], key="inline_xlsx_uploader")
@@ -485,14 +592,46 @@ with tab_hybrid:
             )
             st.dataframe(oven_table, use_container_width=True)
 
-            zones = [f"第{i}节" for i in range(1, 9)]
-            fig_ov_pred = go.Figure()
-            fig_ov_pred.add_trace(go.Scatter(x=zones, y=pred["rec_up_t"], name="推荐上层温度(℃)", line=dict(color="#d62728", width=3)))
-            fig_ov_pred.add_trace(go.Scatter(x=zones, y=pred["rec_low_t"], name="推荐下层温度(℃)", line=dict(color="#1f77b4", width=2.5, dash="dash")))
-            fig_ov_pred.update_layout(
-                title=f"{model_new} 推荐8节烘箱温度曲线 (W_load={pred['w_load']})",
-                xaxis_title="烘箱节数", yaxis_title="设定温度 SV (℃)",
-                height=340, dragmode="pan"
+            st.markdown("#### 4. 自定义温度与风频/风速曲线图")
+            t1_series = {
+                "推荐上层温度": (pred["rec_up_t"], "℃"),
+                "推荐下层温度": (pred["rec_low_t"], "℃"),
+                f"推荐上层送风 ({pred['fan_unit']})": (pred["rec_up_sup"], pred["fan_unit"]),
+                f"推荐上层排风 ({pred['fan_unit']})": (pred["rec_up_exh"], pred["fan_unit"]),
+                f"推荐下层送风 ({pred['fan_unit']})": (pred["rec_low_sup"], pred["fan_unit"]),
+                f"推荐下层排风 ({pred['fan_unit']})": (pred["rec_low_exh"], pred["fan_unit"]),
+            }
+            if m_rec is not None:
+                fu = m_rec.get("风机单位", "Hz")
+                t1_series[f"{m_rec['型号']}-上层温度"] = (m_rec["上温8节"], "℃")
+                t1_series[f"{m_rec['型号']}-下层温度"] = (m_rec["下温8节"], "℃")
+                t1_series[f"{m_rec['型号']}-上层送风 ({fu})"] = (m_rec["上送风8节"], fu)
+                t1_series[f"{m_rec['型号']}-上层排风 ({fu})"] = (m_rec["上排风8节"], fu)
+                t1_series[f"{m_rec['型号']}-下层送风 ({fu})"] = (m_rec["下送风8节"], fu)
+                t1_series[f"{m_rec['型号']}-下层排风 ({fu})"] = (m_rec["下排风8节"], fu)
+
+            t1_all_items = list(t1_series.keys())
+            default_sec_t1 = [f"推荐上层送风 ({pred['fan_unit']})"]
+            c_ax1, c_ax2 = st.columns(2)
+            with c_ax1:
+                t1_pri = st.multiselect(
+                    "主坐标轴项目（温度 / 风频风速）",
+                    t1_all_items,
+                    default=["推荐上层温度", "推荐下层温度"],
+                    key="t1_pri_items"
+                )
+            with c_ax2:
+                t1_sec = st.multiselect(
+                    "次坐标轴项目（风频风速 / 温度）",
+                    t1_all_items,
+                    default=default_sec_t1,
+                    key="t1_sec_items"
+                )
+            fig_ov_pred = build_custom_temp_wind_figure(
+                t1_series,
+                f"{model_new} 8节烘箱自定义温度/风频曲线 (W_load={pred['w_load']})",
+                t1_pri,
+                t1_sec
             )
             st.plotly_chart(fig_ov_pred, use_container_width=True, config={"scrollZoom": False})
 
@@ -507,40 +646,93 @@ with tab_hybrid:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-# -------------------- TAB 2: 7A 模拟参数专项诊断 --------------------
+# -------------------- TAB 2: 模拟参数专项诊断 --------------------
 with tab_diag:
-    st.subheader("🩺 即将生产型号【7A（新线模拟方案）】工艺参数全面体检")
-    col_d1, col_d2 = st.columns([1.1, 1.3], gap="large")
-    with col_d1:
-        st.markdown("#### 1. 涂布核心参数核验")
-        diag_coat_df = pd.DataFrame([
-            {"参数项": "浆料体系 / 固含量", "7A模拟设定": "纯石墨 / 52.0%", "对标基准 (XK新线 / 20CT)": "XK: 硅碳45% | 20CT: 纯石墨49.5%", "诊断结论": "✅ 固含量高，溶剂负荷低"},
-            {"参数项": "A面 / B面总面密度", "7A模拟设定": "4.74 / 9.78 mg/cm²", "对标基准 (XK新线 / 20CT)": "B净增比 +6.33% (5.04 mg/cm²)", "诊断结论": "✅ 略高于 +6.1% 基准，属正常微调"},
-            {"参数项": "30m/min 泵速 (A/B)", "7A模拟设定": "44.4 / 47.2 rpm", "对标基准 (XK新线 / 20CT)": "流量比 K_pump = 0.1624 / 0.1623", "诊断结论": "✅ 与XK(0.1625)高度一致，精准"},
-            {"参数项": "涂布刀距 (A/B)", "7A模拟设定": "105 / 170 μm", "对标基准 (XK新线 / 20CT)": "湿膜厚 9.12 / 9.69 (差值+65μm)", "诊断结论": "⚠️ 略偏大5~10μm(纯石墨可微调至98/163)"},
-            {"参数项": "垫片与分区涂宽", "7A模拟设定": "124.4*3-124.3*2 (涂宽124.6)", "对标基准 (XK新线 / 20CT)": "箔宽672居中，削薄区8mm", "诊断结论": "✅ 分区与垫片完全匹配"}
-        ])
-        st.dataframe(diag_coat_df, use_container_width=True, hide_index=True)
+    st.subheader("🩺 模拟 / 预测 / 设计参数专项诊断")
 
-        st.markdown("#### 2. 溶剂蒸发负荷与烘箱热风诊断")
-        st.warning(
-            "**核心发现：当前 7A 模拟烘箱参数直接套用了 `XK（硅碳 45%固含量，溶剂负荷 210.8）` 的高温模板，对于 `7A（纯石墨 52%固含量，溶剂负荷仅 139.6）` 而言，前段（1~2节）温度偏高！**"
+    manual_d = st.session_state.get("latest_manual_design")
+    manual_is_sim = bool(st.session_state.get("manual_design_active") and manual_d and has_sim_keyword(manual_d.get("型号", "")))
+    imp_rec, trigger_reason = find_target_sim_record(
+        st.session_state.db_records,
+        manual_model_name=manual_d.get("型号", "") if manual_d else "",
+        manual_has_input=manual_is_sim
+    )
+
+    if imp_rec is not None:
+        st.caption(f"诊断触发依据：{trigger_reason}")
+        m_info = compute_physics_metrics(imp_rec)
+        pred_imp = predict_full_process(
+            st.session_state.db_records,
+            imp_rec.get("产线设备", "新线(rpm风速)"),
+            imp_rec.get("体系", "纯石墨"),
+            imp_rec.get("固含量", 0.50),
+            imp_rec.get("A面密度", 4.74),
+            imp_rec.get("B总面密度", 9.78) - imp_rec.get("A面密度", 4.74),
+            imp_rec.get("线速", 30.0),
+            imp_rec.get("涂布宽幅", 124.4),
+            imp_rec.get("真实水分_ppm", 450)
         )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("目标型号", str(imp_rec.get("型号", "-")))
+        c2.metric("浆料体系 / 固含量", f"{imp_rec.get('体系', '-')} / {imp_rec.get('固含量', 0)*100:.1f}%")
+        c3.metric("A/B 实际泵速", f"{imp_rec.get('A泵速', '-')} / {imp_rec.get('B泵速', '-')} rpm")
+        c4.metric("B面溶剂负荷 W_load", f"{m_info['溶剂负荷W_load']}")
 
-    with col_d2:
-        st.markdown("#### 3. 7A 模拟温度曲线 vs 推荐优化曲线对比")
+        diag_rows = [
+            {"检查项": "面密度与B净增", "当前参数": f"A {imp_rec['A面密度']} / B总 {imp_rec['B总面密度']} (净 {m_info['B净面密度']})", "模型参考": f"B净增比 {pred_imp['b_net_ratio']}%"},
+            {"检查项": "泵速 (A/B)", "当前参数": f"{imp_rec['A泵速']} / {imp_rec['B泵速']}", "模型参考": f"{pred_imp['pred_pump_a']} / {pred_imp['pred_pump_b']} rpm"},
+            {"检查项": "刀距 (A/B)", "当前参数": f"{imp_rec['A刀距']} / {imp_rec['B刀距']} μm", "模型参考": f"{pred_imp['pred_gap_a']} / {pred_imp['pred_gap_b']} μm"},
+            {"检查项": "8节上下温均值", "当前参数": f"上 {m_info['上温均值']}℃ / 下 {m_info['下温均值']}℃", "模型参考": f"推荐均值 上 {np.mean(pred_imp['rec_up_t']):.1f}℃ / 下 {np.mean(pred_imp['rec_low_t']):.1f}℃"},
+        ]
+        st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
+
         zones = [f"第{i}节" for i in range(1, 9)]
-        fig_7a = go.Figure()
-        fig_7a.add_trace(go.Scatter(x=zones, y=[92, 100, 102, 113, 118, 110, 108, 100], name="7A模拟-上层温度(℃)", line=dict(color="#d62728", width=3)))
-        fig_7a.add_trace(go.Scatter(x=zones, y=[82, 88, 94, 102, 112, 106, 98, 92], name="7A优化建议-上层温度(℃)", line=dict(color="#2ca02c", width=3, dash="dash")))
-        fig_7a.add_trace(go.Scatter(x=zones, y=[78, 82, 88, 92, 112, 108, 100, 98], name="7A模拟-下层温度(℃)", line=dict(color="#ff7f0e", width=2.5)))
-        fig_7a.add_trace(go.Scatter(x=zones, y=[72, 76, 84, 88, 105, 100, 94, 90], name="7A优化建议-下层温度(℃)", line=dict(color="#1f77b4", width=2.5, dash="dash")))
-        fig_7a.update_layout(
-            title="7A 新线8节烘箱温度设定对比（降低前段升温斜率防SBR迁移）",
-            xaxis_title="烘箱节数", yaxis_title="设定温度 SV (℃)",
-            height=430, dragmode="pan"
+        fig_sim = go.Figure()
+        fig_sim.add_trace(go.Scatter(x=zones, y=imp_rec["上温8节"], name="导入方案-上层温度(℃)", line=dict(color="#d62728", width=3)))
+        fig_sim.add_trace(go.Scatter(x=zones, y=pred_imp["rec_up_t"], name="模型推荐-上层温度(℃)", line=dict(color="#2ca02c", width=3, dash="dash")))
+        fig_sim.add_trace(go.Scatter(x=zones, y=imp_rec["下温8节"], name="导入方案-下层温度(℃)", line=dict(color="#ff7f0e", width=2.5)))
+        fig_sim.add_trace(go.Scatter(x=zones, y=pred_imp["rec_low_t"], name="模型推荐-下层温度(℃)", line=dict(color="#1f77b4", width=2.5, dash="dash")))
+        fig_sim.update_layout(
+            title=f"{imp_rec['型号']} 8节烘箱温度对比",
+            xaxis_title="烘箱节数", yaxis_title="温度 (℃)",
+            height=400, dragmode="pan"
         )
-        st.plotly_chart(fig_7a, use_container_width=True, config={"scrollZoom": False})
+        st.plotly_chart(fig_sim, use_container_width=True, config={"scrollZoom": False})
+
+    elif manual_is_sim and manual_d:
+        st.caption(f"诊断触发依据：手动输入新设计（{manual_d['型号']}）")
+        pred_man = predict_full_process(
+            st.session_state.db_records,
+            manual_d["产线设备"], manual_d["体系"], manual_d["固含量"],
+            manual_d["A面密度"], manual_d["B净面密度"], manual_d["线速"],
+            manual_d["涂布宽幅"], manual_d["目标水分_ppm"]
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("设计型号", manual_d["型号"])
+        c2.metric("体系 / 固含量", f"{manual_d['体系']} / {manual_d['固含量']*100:.1f}%")
+        c3.metric("预测泵速 (A/B)", f"{pred_man['pred_pump_a']} / {pred_man['pred_pump_b']} rpm")
+        c4.metric("溶剂负荷 W_load", f"{pred_man['w_load']}")
+
+        zones = [f"第{i}节" for i in range(1, 9)]
+        fig_man = go.Figure()
+        fig_man.add_trace(go.Scatter(x=zones, y=pred_man["rec_up_t"], name="推荐上层温度(℃)", line=dict(color="#d62728", width=3)))
+        fig_man.add_trace(go.Scatter(x=zones, y=pred_man["rec_low_t"], name="推荐下层温度(℃)", line=dict(color="#1f77b4", width=2.5, dash="dash")))
+        fig_man.update_layout(
+            title=f"{manual_d['型号']} 推荐8节烘箱温度曲线",
+            xaxis_title="烘箱节数", yaxis_title="温度 (℃)",
+            height=380, dragmode="pan"
+        )
+        st.plotly_chart(fig_man, use_container_width=True, config={"scrollZoom": False})
+
+    else:
+        st.info(
+            "当前处于中立状态：未检测到包含“预测/模拟/设计/试产/方案/predict/sim/design/opt”等关键词的导入文件，也未手动输入包含上述关键词的新设计。"
+        )
+        st.markdown("""
+        * **触发条件**：
+          1. 导入的 `.xlsx` 文件中包含相关中英文关键词的型号或备注时，自动定位该导入记录并展示专项诊断；
+          2. 在“手动设计输入”中手动输入包含相关关键词的新设计名称时，自动针对该新设计生成诊断结果。
+        """)
 
 # -------------------- TAB 3: 烘箱温风与真实水分关联分析 --------------------
 with tab_oven:
@@ -584,6 +776,33 @@ with tab_oven:
         )
         st.plotly_chart(fig_t, use_container_width=True, config={"scrollZoom": False})
     st.dataframe(df_ov, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("#### 自定义型号 8 节温度与风频/风速双轴曲线")
+    all_rec_names = [r["型号"] for r in st.session_state.db_records]
+    sel_ov_model = st.selectbox("选择对比型号", all_rec_names, index=0, key="t3_model_sel")
+    sel_rec = next((r for r in st.session_state.db_records if r["型号"] == sel_ov_model), st.session_state.db_records[0])
+    fu3 = sel_rec.get("风机单位", "Hz")
+    t3_series = {
+        "上层温度": (sel_rec["上温8节"], "℃"),
+        "下层温度": (sel_rec["下温8节"], "℃"),
+        f"上层送风 ({fu3})": (sel_rec["上送风8节"], fu3),
+        f"上层排风 ({fu3})": (sel_rec["上排风8节"], fu3),
+        f"下层送风 ({fu3})": (sel_rec["下送风8节"], fu3),
+        f"下层排风 ({fu3})": (sel_rec["下排风8节"], fu3),
+    }
+    c3_a, c3_b = st.columns(2)
+    with c3_a:
+        t3_pri = st.multiselect("主坐标轴项目", list(t3_series.keys()), default=["上层温度", "下层温度"], key="t3_pri_items")
+    with c3_b:
+        t3_sec = st.multiselect("次坐标轴项目", list(t3_series.keys()), default=[f"上层送风 ({fu3})"], key="t3_sec_items")
+    fig_t3_custom = build_custom_temp_wind_figure(
+        t3_series,
+        f"{sel_rec['型号']} 8节烘箱自定义温度与风频/风速曲线",
+        t3_pri,
+        t3_sec
+    )
+    st.plotly_chart(fig_t3_custom, use_container_width=True, config={"scrollZoom": False})
 
 # -------------------- TAB 4: 箔材/分区/卷径计算器 --------------------
 with tab_foil:
